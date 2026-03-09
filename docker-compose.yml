@@ -1,0 +1,13 @@
+services:
+  gemini-cli-proxy:
+    build: .
+    container_name: gemini-cli-proxy
+    user: "1000:1000"
+    restart: always
+    ports:
+      - "${PORT}:4000"
+    volumes:
+      - ${GEMINI_CONFIG_PATH}:/home/node/.gemini
+    environment:
+      - PORT=4000
+      - HOME=/home/node
