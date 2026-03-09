@@ -1,9 +1,7 @@
 import json
 import pytest
 import requests
-
-BASE_URL = "http://localhost:8080"
-REQUEST_TIMEOUT = 120  # seconds
+from conftest import BASE_URL, REQUEST_TIMEOUT, auth_headers
 
 def test_openai_compatible_chat_completion():
     """
@@ -15,7 +13,7 @@ def test_openai_compatible_chat_completion():
         "model": "gemini-2.5-flash",
         "messages": [{"role": "user", "content": "Say hello!"}]
     }
-    response = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=REQUEST_TIMEOUT)
+    response = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, headers=auth_headers(), timeout=REQUEST_TIMEOUT)
 
     assert response.status_code == 200
     data = response.json()
@@ -34,7 +32,7 @@ def test_gemini_ultra_quota_leverage():
         "model": "gemini-2.5-flash",
         "messages": [{"role": "user", "content": "What is the capital of France?"}]
     }
-    response = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=REQUEST_TIMEOUT)
+    response = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, headers=auth_headers(), timeout=REQUEST_TIMEOUT)
     assert response.status_code == 200
     assert "choices" in response.json()
     assert len(response.json()["choices"][0]["message"]["content"]) > 0
@@ -51,7 +49,7 @@ def test_streaming_chat_completion():
         "stream": True,
     }
     response = requests.post(
-        f"{BASE_URL}/v1/chat/completions", json=payload, timeout=REQUEST_TIMEOUT, stream=True
+        f"{BASE_URL}/v1/chat/completions", json=payload, headers=auth_headers(), timeout=REQUEST_TIMEOUT, stream=True
     )
 
     assert response.status_code == 200
@@ -86,7 +84,7 @@ def test_thinking_chat_completion():
         "messages": [{"role": "user", "content": "What is 2+2?"}],
         "thinking": {"budget_tokens": 1024},
     }
-    response = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=REQUEST_TIMEOUT)
+    response = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, headers=auth_headers(), timeout=REQUEST_TIMEOUT)
 
     assert response.status_code == 200
     data = response.json()
@@ -108,7 +106,7 @@ def test_streaming_with_thinking():
         "thinking": {"budget_tokens": 1024},
     }
     response = requests.post(
-        f"{BASE_URL}/v1/chat/completions", json=payload, timeout=REQUEST_TIMEOUT, stream=True
+        f"{BASE_URL}/v1/chat/completions", json=payload, headers=auth_headers(), timeout=REQUEST_TIMEOUT, stream=True
     )
 
     assert response.status_code == 200

@@ -20,6 +20,18 @@ const OAUTH_CREDS_PATH = process.env.OAUTH_CREDS_PATH ||
 
 const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
 
+// --- Logging ---
+
+function timestamp() {
+    return new Date().toISOString();
+}
+
+function log(level, msg, meta) {
+    const entry = { time: timestamp(), level, msg };
+    if (meta) Object.assign(entry, meta);
+    console.log(JSON.stringify(entry));
+}
+
 // Available models exposed via /v1/models
 const AVAILABLE_MODELS = [
     { id: 'gemini-2.5-pro', owned_by: 'google' },
@@ -41,11 +53,13 @@ function authenticate(req, res, next) {
 
     const authHeader = req.headers.authorization;
     if (!authHeader) {
+        log('warn', 'Auth rejected: missing header', { ip: req.ip, path: req.path });
         return res.status(401).json({ error: { message: 'Missing Authorization header', type: 'auth_error' } });
     }
 
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
     if (token !== PROXY_API_KEY) {
+        log('warn', 'Auth rejected: invalid key', { ip: req.ip, path: req.path });
         return res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error' } });
     }
 
@@ -72,7 +86,7 @@ async function getAccessToken() {
         return cachedAccessToken;
     }
 
-    console.log('Refreshing OAuth access token...');
+    log('info', 'Refreshing OAuth access token');
     const params = new URLSearchParams({
         grant_type: 'refresh_token',
         client_id: CLIENT_ID,
@@ -101,7 +115,7 @@ async function getAccessToken() {
         if (data.id_token) creds.id_token = data.id_token;
         fs.writeFileSync(OAUTH_CREDS_PATH, JSON.stringify(creds, null, 2));
     } catch (e) {
-        console.warn('Could not update oauth_creds.json:', e.message);
+        log('warn', 'Could not update oauth_creds.json', { error: e.message });
     }
 
     return cachedAccessToken;
@@ -110,7 +124,7 @@ async function getAccessToken() {
 async function discoverProjectId(token) {
     if (projectId) return projectId;
 
-    console.log('Discovering project ID via loadCodeAssist...');
+    log('info', 'Discovering project ID via loadCodeAssist');
     const resp = await fetch(`${GEMINI_API_BASE}:loadCodeAssist`, {
         method: 'POST',
         headers: {
@@ -130,7 +144,7 @@ async function discoverProjectId(token) {
     if (!projectId) {
         throw new Error(`No project ID in loadCodeAssist response: ${JSON.stringify(data)}`);
     }
-    console.log(`Discovered project ID: ${projectId}`);
+    log('info', 'Discovered project ID', { projectId });
     return projectId;
 }
 
@@ -462,7 +476,7 @@ async function handleStreaming(req, res, token, project) {
             }
         }
     } catch (streamErr) {
-        console.error(`Stream error: ${streamErr.message}`);
+        log('error', 'Stream error', { error: streamErr.message });
     }
 
     sendChunk({}, hasToolCalls ? 'tool_calls' : 'stop');
@@ -475,6 +489,7 @@ async function handleStreaming(req, res, token, project) {
 app.use(bodyParser.json());
 
 app.get('/v1/models', authenticate, (req, res) => {
+    log('info', 'GET /v1/models', { ip: req.ip });
     res.json({
         object: 'list',
         data: AVAILABLE_MODELS.map(m => ({
@@ -487,11 +502,23 @@ app.get('/v1/models', authenticate, (req, res) => {
 });
 
 app.post('/v1/chat/completions', authenticate, async (req, res) => {
-    const { model, messages, stream } = req.body;
+    const { model, messages, stream, tools } = req.body;
     const geminiModel = model || DEFAULT_MODEL;
+    const startTime = Date.now();
+    const reqId = uuidv4().slice(0, 8);
 
-    const promptPreview = messages[messages.length - 1]?.content?.substring(0, 80);
-    console.log(`Request: model=${geminiModel}, stream=${!!stream}, prompt="${promptPreview}"`);
+    const lastMsg = messages[messages.length - 1];
+    const promptPreview = lastMsg?.content?.substring(0, 100) || '(tool result)';
+
+    log('info', 'Request', {
+        reqId,
+        ip: req.ip,
+        model: geminiModel,
+        stream: !!stream,
+        messages: messages.length,
+        tools: tools?.length || 0,
+        prompt: promptPreview,
+    });
 
     try {
         const token = await getAccessToken();
@@ -502,8 +529,12 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
         } else {
             await handleNonStreaming(req, res, token, project);
         }
+
+        const durationMs = Date.now() - startTime;
+        log('info', 'Response', { reqId, model: geminiModel, stream: !!stream, durationMs });
     } catch (err) {
-        console.error(`Error: ${err.message}`);
+        const durationMs = Date.now() - startTime;
+        log('error', 'Request failed', { reqId, model: geminiModel, durationMs, error: err.message });
         if (!res.headersSent) {
             res.status(500).json({
                 error: {
@@ -522,8 +553,10 @@ app.get('/health/readiness', (req, res) => {
 });
 
 app.listen(port, '0.0.0.0', () => {
-    console.log(`Gemini CLI Proxy listening at http://0.0.0.0:${port}`);
-    console.log(`Using OAuth creds from: ${OAUTH_CREDS_PATH}`);
-    console.log(`Default model: ${DEFAULT_MODEL}`);
-    console.log(`API key auth: ${PROXY_API_KEY ? 'enabled' : 'disabled (set PROXY_API_KEY to enable)'}`);
+    log('info', 'Server started', {
+        port,
+        oauthCreds: OAUTH_CREDS_PATH,
+        defaultModel: DEFAULT_MODEL,
+        auth: PROXY_API_KEY ? 'enabled' : 'disabled',
+    });
 });

@@ -1,10 +1,10 @@
 import subprocess
 import time
+import os
 import pytest
 import requests
+from conftest import BASE_URL, REQUEST_TIMEOUT, get_proxy_api_key
 
-BASE_URL = "http://localhost:8080"
-REQUEST_TIMEOUT = 30
 TEST_API_KEY = "test-secret-key-12345"
 
 
@@ -17,7 +17,6 @@ def _restart_with_env(env_vars):
         capture_output=True,
         env={**_get_base_env(), **env_vars},
     )
-    # Wait for the container to be ready
     for _ in range(20):
         try:
             resp = requests.get(f"{BASE_URL}/health/readiness", timeout=2)
@@ -31,10 +30,9 @@ def _restart_with_env(env_vars):
 
 def _get_base_env():
     """Get the base environment from .env file and system."""
-    import os
     env = os.environ.copy()
-    # Read .env file
-    with open(".env") as f:
+    env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+    with open(env_path) as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
@@ -43,15 +41,10 @@ def _get_base_env():
     return env
 
 
-def test_no_auth_when_key_not_set():
-    """
-    Scenario: No API key configured
-    - WHEN PROXY_API_KEY is not set
-    - THEN requests without Authorization header SHALL succeed.
-    """
-    # Default deployment has no PROXY_API_KEY set
-    response = requests.get(f"{BASE_URL}/v1/models", timeout=REQUEST_TIMEOUT)
-    assert response.status_code == 200
+def _restore_original():
+    """Restore the proxy with original .env settings."""
+    key = get_proxy_api_key()
+    _restart_with_env({"PROXY_API_KEY": key})
 
 
 def test_auth_rejects_missing_header():
@@ -66,8 +59,7 @@ def test_auth_rejects_missing_header():
         assert response.status_code == 401
         assert "auth_error" in response.json()["error"]["type"]
     finally:
-        # Restore original state (no API key)
-        _restart_with_env({"PROXY_API_KEY": ""})
+        _restore_original()
 
 
 def test_auth_rejects_wrong_key():
@@ -85,7 +77,7 @@ def test_auth_rejects_wrong_key():
         )
         assert response.status_code == 401
     finally:
-        _restart_with_env({"PROXY_API_KEY": ""})
+        _restore_original()
 
 
 def test_auth_accepts_correct_key():
@@ -104,4 +96,18 @@ def test_auth_accepts_correct_key():
         assert response.status_code == 200
         assert response.json()["object"] == "list"
     finally:
+        _restore_original()
+
+
+def test_no_auth_when_key_not_set():
+    """
+    Scenario: No API key configured
+    - WHEN PROXY_API_KEY is not set
+    - THEN requests without Authorization header SHALL succeed.
+    """
+    try:
         _restart_with_env({"PROXY_API_KEY": ""})
+        response = requests.get(f"{BASE_URL}/v1/models", timeout=REQUEST_TIMEOUT)
+        assert response.status_code == 200
+    finally:
+        _restore_original()

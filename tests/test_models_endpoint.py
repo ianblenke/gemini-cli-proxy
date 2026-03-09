@@ -1,8 +1,6 @@
 import pytest
 import requests
-
-BASE_URL = "http://localhost:8080"
-REQUEST_TIMEOUT = 30
+from conftest import BASE_URL, REQUEST_TIMEOUT, auth_headers
 
 def test_list_models():
     """
@@ -10,7 +8,7 @@ def test_list_models():
     - WHEN a client sends GET /v1/models
     - THEN the proxy SHALL return the list of available Gemini models in OpenAI format.
     """
-    response = requests.get(f"{BASE_URL}/v1/models", timeout=REQUEST_TIMEOUT)
+    response = requests.get(f"{BASE_URL}/v1/models", headers=auth_headers(), timeout=REQUEST_TIMEOUT)
 
     assert response.status_code == 200
     data = response.json()

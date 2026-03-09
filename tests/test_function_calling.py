@@ -1,9 +1,7 @@
 import json
 import pytest
 import requests
-
-BASE_URL = "http://localhost:8080"
-REQUEST_TIMEOUT = 120
+from conftest import BASE_URL, REQUEST_TIMEOUT, auth_headers
 
 WEATHER_TOOL = {
     "type": "function",
@@ -34,7 +32,7 @@ def test_function_call_triggered():
         ],
         "tools": [WEATHER_TOOL],
     }
-    response = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=REQUEST_TIMEOUT)
+    response = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, headers=auth_headers(), timeout=REQUEST_TIMEOUT)
 
     assert response.status_code == 200
     data = response.json()
@@ -66,7 +64,7 @@ def test_function_call_roundtrip():
         ],
         "tools": [WEATHER_TOOL],
     }
-    resp1 = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=REQUEST_TIMEOUT)
+    resp1 = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, headers=auth_headers(), timeout=REQUEST_TIMEOUT)
     assert resp1.status_code == 200
     data1 = resp1.json()
 
@@ -92,7 +90,7 @@ def test_function_call_roundtrip():
         ],
         "tools": [WEATHER_TOOL],
     }
-    resp2 = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload2, timeout=REQUEST_TIMEOUT)
+    resp2 = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload2, headers=auth_headers(), timeout=REQUEST_TIMEOUT)
     assert resp2.status_code == 200
     data2 = resp2.json()
 
@@ -117,7 +115,7 @@ def test_function_call_streaming():
         "stream": True,
     }
     response = requests.post(
-        f"{BASE_URL}/v1/chat/completions", json=payload, timeout=REQUEST_TIMEOUT, stream=True
+        f"{BASE_URL}/v1/chat/completions", json=payload, headers=auth_headers(), timeout=REQUEST_TIMEOUT, stream=True
     )
     assert response.status_code == 200
 

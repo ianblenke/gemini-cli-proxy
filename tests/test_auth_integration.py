@@ -1,9 +1,7 @@
 import subprocess
 import pytest
 import requests
-
-BASE_URL = "http://localhost:8080"
-REQUEST_TIMEOUT = 120  # seconds
+from conftest import BASE_URL, REQUEST_TIMEOUT, auth_headers
 
 def test_auth_integration_gemini_mounting():
     """
@@ -27,7 +25,7 @@ def test_gemini_cli_auth_success():
         "model": "gemini-2.5-flash",
         "messages": [{"role": "user", "content": "Ping"}]
     }
-    response = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=REQUEST_TIMEOUT)
+    response = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, headers=auth_headers(), timeout=REQUEST_TIMEOUT)
 
     assert response.status_code == 200
     assert "choices" in response.json()
