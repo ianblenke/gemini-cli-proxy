@@ -18,10 +18,41 @@ const DEFAULT_MODEL = 'gemini-2.5-flash';
 const OAUTH_CREDS_PATH = process.env.OAUTH_CREDS_PATH ||
     path.join(process.env.HOME || '/home/node', '.gemini', 'oauth_creds.json');
 
+const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
+
+// Available models exposed via /v1/models
+const AVAILABLE_MODELS = [
+    { id: 'gemini-2.5-pro', owned_by: 'google' },
+    { id: 'gemini-2.5-flash', owned_by: 'google' },
+    { id: 'gemini-2.5-flash-lite', owned_by: 'google' },
+    { id: 'gemini-3-pro-preview', owned_by: 'google' },
+    { id: 'gemini-3-flash-preview', owned_by: 'google' },
+];
+
 // In-memory token cache
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 let projectId = null;
+
+// --- Auth middleware ---
+
+function authenticate(req, res, next) {
+    if (!PROXY_API_KEY) return next();
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+        return res.status(401).json({ error: { message: 'Missing Authorization header', type: 'auth_error' } });
+    }
+
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+    if (token !== PROXY_API_KEY) {
+        return res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error' } });
+    }
+
+    next();
+}
+
+// --- OAuth token management ---
 
 function loadOauthCreds() {
     const raw = fs.readFileSync(OAUTH_CREDS_PATH, 'utf8');
@@ -64,7 +95,6 @@ async function getAccessToken() {
     cachedAccessToken = data.access_token;
     tokenExpiresAt = Date.now() + (data.expires_in * 1000);
 
-    // Update the creds file so the gemini CLI can also benefit from the refresh
     try {
         creds.access_token = data.access_token;
         creds.expiry_date = tokenExpiresAt;
@@ -104,6 +134,23 @@ async function discoverProjectId(token) {
     return projectId;
 }
 
+// --- OpenAI <-> Gemini format conversion ---
+
+function convertToolsToGemini(tools) {
+    if (!tools || tools.length === 0) return undefined;
+
+    const functionDeclarations = tools
+        .filter(t => t.type === 'function')
+        .map(t => ({
+            name: t.function.name,
+            description: t.function.description || '',
+            parametersJsonSchema: t.function.parameters,
+        }));
+
+    if (functionDeclarations.length === 0) return undefined;
+    return [{ functionDeclarations }];
+}
+
 function convertMessages(messages) {
     const contents = [];
     let systemInstruction = null;
@@ -114,10 +161,44 @@ function convertMessages(messages) {
                 role: 'system',
                 parts: [{ text: msg.content }],
             };
+        } else if (msg.role === 'assistant' && msg.tool_calls) {
+            // Assistant message with tool calls -> model message with functionCall parts
+            const parts = [];
+            if (msg.content) {
+                parts.push({ text: msg.content });
+            }
+            for (const tc of msg.tool_calls) {
+                parts.push({
+                    functionCall: {
+                        id: tc.id,
+                        name: tc.function.name,
+                        args: typeof tc.function.arguments === 'string'
+                            ? JSON.parse(tc.function.arguments)
+                            : tc.function.arguments,
+                    },
+                });
+            }
+            contents.push({ role: 'model', parts });
+        } else if (msg.role === 'tool') {
+            // Tool result -> user message with functionResponse part
+            // Try to merge consecutive tool messages into one user turn
+            const lastContent = contents[contents.length - 1];
+            const part = {
+                functionResponse: {
+                    id: msg.tool_call_id,
+                    name: msg.name || '',
+                    response: { output: msg.content },
+                },
+            };
+            if (lastContent && lastContent.role === 'user' && lastContent.parts[0]?.functionResponse) {
+                lastContent.parts.push(part);
+            } else {
+                contents.push({ role: 'user', parts: [part] });
+            }
         } else {
             contents.push({
                 role: msg.role === 'assistant' ? 'model' : 'user',
-                parts: [{ text: msg.content }],
+                parts: [{ text: msg.content || '' }],
             });
         }
     }
@@ -125,7 +206,26 @@ function convertMessages(messages) {
     return { contents, systemInstruction };
 }
 
-function buildRequestBody(model, project, messages, thinkingBudget) {
+function convertGeminiFunctionCallsToOpenAI(parts) {
+    const toolCalls = [];
+    for (const part of parts) {
+        if (part.functionCall) {
+            toolCalls.push({
+                id: part.functionCall.id || `call_${uuidv4().slice(0, 8)}`,
+                type: 'function',
+                function: {
+                    name: part.functionCall.name,
+                    arguments: JSON.stringify(part.functionCall.args || {}),
+                },
+            });
+        }
+    }
+    return toolCalls;
+}
+
+// --- Request building ---
+
+function buildRequestBody(model, project, messages, thinkingBudget, tools) {
     const { contents, systemInstruction } = convertMessages(messages);
 
     const body = {
@@ -153,6 +253,11 @@ function buildRequestBody(model, project, messages, thinkingBudget) {
         body.request.systemInstruction = systemInstruction;
     }
 
+    const geminiTools = convertToolsToGemini(tools);
+    if (geminiTools) {
+        body.request.tools = geminiTools;
+    }
+
     return body;
 }
 
@@ -162,6 +267,7 @@ function parseSSEResponse(sseText) {
     const lines = sseText.split('\n');
     let contentText = '';
     let thinkingText = '';
+    let allParts = [];
     let usage = {};
     let modelVersion = '';
 
@@ -173,7 +279,10 @@ function parseSSEResponse(sseText) {
             const candidate = resp.candidates?.[0];
             if (candidate?.content?.parts) {
                 for (const part of candidate.content.parts) {
-                    if (part.text && part.thought) {
+                    allParts.push(part);
+                    if (part.functionCall) {
+                        // collected in allParts
+                    } else if (part.text && part.thought) {
                         thinkingText += part.text;
                     } else if (part.text) {
                         contentText += part.text;
@@ -187,15 +296,15 @@ function parseSSEResponse(sseText) {
         }
     }
 
-    return { contentText, thinkingText, usage, modelVersion };
+    return { contentText, thinkingText, allParts, usage, modelVersion };
 }
 
 async function handleNonStreaming(req, res, token, project) {
-    const { model, messages } = req.body;
+    const { model, messages, tools } = req.body;
     const geminiModel = model || DEFAULT_MODEL;
     const thinkingBudget = req.body.thinking?.budget_tokens || 0;
 
-    const body = buildRequestBody(geminiModel, project, messages, thinkingBudget);
+    const body = buildRequestBody(geminiModel, project, messages, thinkingBudget, tools);
 
     const resp = await fetch(`${GEMINI_API_BASE}:streamGenerateContent?alt=sse`, {
         method: 'POST',
@@ -212,14 +321,19 @@ async function handleNonStreaming(req, res, token, project) {
     }
 
     const sseText = await resp.text();
-    const { contentText, thinkingText, usage, modelVersion } = parseSSEResponse(sseText);
+    const { contentText, thinkingText, allParts, usage, modelVersion } = parseSSEResponse(sseText);
+
+    const toolCalls = convertGeminiFunctionCallsToOpenAI(allParts);
 
     const message = {
         role: 'assistant',
-        content: contentText,
+        content: contentText || null,
     };
     if (thinkingText) {
         message.reasoning_content = thinkingText;
+    }
+    if (toolCalls.length > 0) {
+        message.tool_calls = toolCalls;
     }
 
     res.json({
@@ -230,7 +344,7 @@ async function handleNonStreaming(req, res, token, project) {
         choices: [{
             index: 0,
             message,
-            finish_reason: 'stop',
+            finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
         }],
         usage: {
             prompt_tokens: usage.promptTokenCount || -1,
@@ -243,13 +357,13 @@ async function handleNonStreaming(req, res, token, project) {
 // --- Streaming path ---
 
 async function handleStreaming(req, res, token, project) {
-    const { model, messages } = req.body;
+    const { model, messages, tools } = req.body;
     const geminiModel = model || DEFAULT_MODEL;
     const thinkingBudget = req.body.thinking?.budget_tokens || 0;
     const chatId = `chatcmpl-${uuidv4()}`;
     const created = Math.floor(Date.now() / 1000);
 
-    const body = buildRequestBody(geminiModel, project, messages, thinkingBudget);
+    const body = buildRequestBody(geminiModel, project, messages, thinkingBudget, tools);
 
     const resp = await fetch(`${GEMINI_API_BASE}:streamGenerateContent?alt=sse`, {
         method: 'POST',
@@ -272,6 +386,8 @@ async function handleStreaming(req, res, token, project) {
 
     let resolvedModel = geminiModel;
     let sentRole = false;
+    let toolCallIndex = 0;
+    let hasToolCalls = false;
 
     function sendChunk(delta, finishReason) {
         const chunk = {
@@ -288,7 +404,6 @@ async function handleStreaming(req, res, token, project) {
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     }
 
-    // Process the SSE stream from Gemini
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -300,7 +415,7 @@ async function handleStreaming(req, res, token, project) {
 
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
-            buffer = lines.pop(); // keep incomplete line in buffer
+            buffer = lines.pop();
 
             for (const line of lines) {
                 if (!line.startsWith('data: ')) continue;
@@ -318,16 +433,29 @@ async function handleStreaming(req, res, token, project) {
                 if (!candidate?.content?.parts) continue;
 
                 for (const part of candidate.content.parts) {
-                    if (!part.text) continue;
-
                     if (!sentRole) {
                         sendChunk({ role: 'assistant' }, null);
                         sentRole = true;
                     }
 
-                    if (part.thought) {
+                    if (part.functionCall) {
+                        hasToolCalls = true;
+                        const callId = part.functionCall.id || `call_${uuidv4().slice(0, 8)}`;
+                        sendChunk({
+                            tool_calls: [{
+                                index: toolCallIndex,
+                                id: callId,
+                                type: 'function',
+                                function: {
+                                    name: part.functionCall.name,
+                                    arguments: JSON.stringify(part.functionCall.args || {}),
+                                },
+                            }],
+                        }, null);
+                        toolCallIndex++;
+                    } else if (part.text && part.thought) {
                         sendChunk({ reasoning_content: part.text }, null);
-                    } else {
+                    } else if (part.text) {
                         sendChunk({ content: part.text }, null);
                     }
                 }
@@ -337,8 +465,7 @@ async function handleStreaming(req, res, token, project) {
         console.error(`Stream error: ${streamErr.message}`);
     }
 
-    // Send finish chunk
-    sendChunk({}, 'stop');
+    sendChunk({}, hasToolCalls ? 'tool_calls' : 'stop');
     res.write('data: [DONE]\n\n');
     res.end();
 }
@@ -347,7 +474,19 @@ async function handleStreaming(req, res, token, project) {
 
 app.use(bodyParser.json());
 
-app.post('/v1/chat/completions', async (req, res) => {
+app.get('/v1/models', authenticate, (req, res) => {
+    res.json({
+        object: 'list',
+        data: AVAILABLE_MODELS.map(m => ({
+            id: m.id,
+            object: 'model',
+            created: 0,
+            owned_by: m.owned_by,
+        })),
+    });
+});
+
+app.post('/v1/chat/completions', authenticate, async (req, res) => {
     const { model, messages, stream } = req.body;
     const geminiModel = model || DEFAULT_MODEL;
 
@@ -386,4 +525,5 @@ app.listen(port, '0.0.0.0', () => {
     console.log(`Gemini CLI Proxy listening at http://0.0.0.0:${port}`);
     console.log(`Using OAuth creds from: ${OAUTH_CREDS_PATH}`);
     console.log(`Default model: ${DEFAULT_MODEL}`);
+    console.log(`API key auth: ${PROXY_API_KEY ? 'enabled' : 'disabled (set PROXY_API_KEY to enable)'}`);
 });

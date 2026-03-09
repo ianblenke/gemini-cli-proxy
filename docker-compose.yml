@@ -11,3 +11,6 @@ services:
     environment:
       - PORT=4000
       - HOME=/home/node
+      - PROXY_API_KEY=${PROXY_API_KEY:-}
+      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}
+      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
