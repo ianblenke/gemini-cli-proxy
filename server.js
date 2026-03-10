@@ -41,8 +41,6 @@ const AVAILABLE_MODELS = [
     { id: 'gemini-3-flash-preview', owned_by: 'google' },
     { id: 'gemini-3.1-pro-preview', owned_by: 'google' },
     { id: 'gemini-3.1-flash-lite-preview', owned_by: 'google' },
-    { id: 'gemini-3.1-flash-image-preview', owned_by: 'google' },
-    { id: 'gemini-3-pro-image-preview', owned_by: 'google' },
 ];
 
 // In-memory token cache
