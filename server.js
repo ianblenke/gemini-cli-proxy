@@ -40,13 +40,18 @@ const AVAILABLE_MODELS = [
     { id: 'gemini-3-pro-preview', owned_by: 'google' },
     { id: 'gemini-3-flash-preview', owned_by: 'google' },
     { id: 'gemini-3.1-pro-preview', owned_by: 'google' },
-    { id: 'gemini-3.1-flash-lite-preview', owned_by: 'google' },
 ];
 
 // In-memory token cache
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 let projectId = null;
+
+// Cache thought parts (with thought_signature) keyed by tool call ID.
+// Gemini 3.x requires thought_signature on round-trips but the OpenAI format has no way
+// to carry it, so we cache server-side and re-inject when the client echoes back tool_calls.
+const thoughtCache = new Map();
+const THOUGHT_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
 // --- Auth middleware ---
 
@@ -150,6 +155,148 @@ async function discoverProjectId(token) {
     return projectId;
 }
 
+// --- Retry and fallback logic ---
+
+const MAX_RETRIES = 5;
+const RETRY_STATUS_CODES = new Set([429, 499, 500, 502, 503, 504]);
+
+// Model fallback chain — when a model is rate-limited, try the next one
+const MODEL_FALLBACKS = {
+    'gemini-3.1-pro-preview':   'gemini-3-pro-preview',
+    'gemini-3-pro-preview':     'gemini-2.5-pro',
+    'gemini-2.5-pro':           'gemini-2.5-flash',
+    'gemini-3-flash-preview':   'gemini-2.5-flash',
+    'gemini-2.5-flash':         'gemini-2.5-flash-lite',
+};
+
+// Per-model cooldown: tracks when each model's quota resets
+// { model: expiresAtTimestamp }
+const modelCooldowns = new Map();
+
+function isQuotaExhausted(errBody) {
+    return errBody.includes('RATE_LIMIT_EXCEEDED') ||
+           errBody.includes('exhausted your capacity') ||
+           errBody.includes('QuotaFailure');
+}
+
+function parseResetSeconds(errBody) {
+    const match = errBody.match(/after (\d+)s/);
+    return match ? parseInt(match[1]) : 0;
+}
+
+function setModelCooldown(model, resetSeconds) {
+    const expiresAt = Date.now() + (resetSeconds * 1000);
+    modelCooldowns.set(model, expiresAt);
+}
+
+function isModelCoolingDown(model) {
+    const expiresAt = modelCooldowns.get(model);
+    if (!expiresAt) return false;
+    if (Date.now() >= expiresAt) {
+        modelCooldowns.delete(model);
+        return false;
+    }
+    return true;
+}
+
+// Walk the fallback chain to find the best available model
+function resolveAvailableModel(requestedModel) {
+    let model = requestedModel;
+    while (isModelCoolingDown(model)) {
+        const fallback = MODEL_FALLBACKS[model];
+        if (!fallback) break;
+        model = fallback;
+    }
+    return model;
+}
+
+function swapModelInBody(bodyStr, newModel) {
+    const body = JSON.parse(bodyStr);
+    body.model = newModel;
+
+    // Fix thinkingConfig when crossing Gemini 3 ↔ 2.5 boundary
+    const tc = body.request?.generationConfig?.thinkingConfig;
+    if (tc) {
+        if (isGemini3Model(newModel)) {
+            // Gemini 3 uses thinkingLevel, not thinkingBudget
+            delete tc.thinkingBudget;
+            tc.thinkingLevel = tc.thinkingLevel || 'HIGH';
+        } else {
+            // Gemini 2.5 uses thinkingBudget, not thinkingLevel
+            delete tc.thinkingLevel;
+            tc.thinkingBudget = tc.thinkingBudget || 8192;
+        }
+    }
+
+    return JSON.stringify(body);
+}
+
+async function fetchWithRetry(url, options, reqId) {
+    let lastResp;
+    let currentBody = options.body;
+    let requestedModel = null;
+    try { requestedModel = JSON.parse(currentBody).model; } catch (e) {}
+
+    // Skip models known to be cooling down
+    let currentModel = resolveAvailableModel(requestedModel);
+    if (currentModel !== requestedModel) {
+        log('info', 'Skipping cooled-down model', {
+            reqId, requested: requestedModel, using: currentModel,
+        });
+        currentBody = swapModelInBody(currentBody, currentModel);
+    }
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        lastResp = await fetch(url, { ...options, body: currentBody });
+        if (lastResp.ok || !RETRY_STATUS_CODES.has(lastResp.status)) {
+            // Attach the actual model used so handlers can report it
+            lastResp._actualModel = currentModel;
+            return lastResp;
+        }
+
+        if (attempt >= MAX_RETRIES) break;
+
+        let errBody = '';
+        try { errBody = await lastResp.text(); } catch (e) {}
+
+        if (lastResp.status === 429 && isQuotaExhausted(errBody) && currentModel) {
+            // Record cooldown for this model
+            const resetSecs = parseResetSeconds(errBody);
+            if (resetSecs > 0) {
+                setModelCooldown(currentModel, resetSecs);
+            }
+
+            // Try fallback model
+            const fallback = MODEL_FALLBACKS[currentModel];
+            if (fallback && !isModelCoolingDown(fallback)) {
+                log('warn', 'Model quota exhausted, falling back', {
+                    reqId, from: currentModel, to: fallback,
+                    cooldownSecs: resetSecs,
+                });
+                currentBody = swapModelInBody(currentBody, fallback);
+                currentModel = fallback;
+                await new Promise(r => setTimeout(r, 500));
+                continue;
+            }
+
+            // All models exhausted — fail fast, don't make the client wait
+            log('warn', 'All models quota exhausted', {
+                reqId, model: currentModel, cooldownSecs: resetSecs,
+            });
+            throw new Error(`Gemini API error (429): All models quota exhausted. Retry after ${resetSecs}s.`);
+        }
+
+        // Transient error (not quota) — retry with short backoff
+        let delayMs = 100 * Math.pow(2, attempt);
+        log('warn', 'Retrying request (transient)', {
+            reqId, attempt: attempt + 1, status: lastResp.status,
+            model: currentModel, delayMs,
+        });
+        await new Promise(r => setTimeout(r, delayMs));
+    }
+    return lastResp;
+}
+
 // --- OpenAI <-> Gemini format conversion ---
 
 function convertToolsToGemini(tools) {
@@ -167,6 +314,26 @@ function convertToolsToGemini(tools) {
     return [{ functionDeclarations }];
 }
 
+function convertContentToParts(content) {
+    if (!content) return [{ text: '' }];
+    if (typeof content === 'string') return [{ text: content }];
+
+    // OpenAI multi-modal content array
+    const parts = [];
+    for (const item of content) {
+        if (item.type === 'text') {
+            parts.push({ text: item.text });
+        } else if (item.type === 'image_url') {
+            const url = item.image_url?.url || '';
+            const match = url.match(/^data:([^;]+);base64,(.+)$/);
+            if (match) {
+                parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+            }
+        }
+    }
+    return parts.length > 0 ? parts : [{ text: '' }];
+}
+
 function convertMessages(messages) {
     const contents = [];
     let systemInstruction = null;
@@ -179,12 +346,22 @@ function convertMessages(messages) {
             };
         } else if (msg.role === 'assistant' && msg.tool_calls) {
             // Assistant message with tool calls -> model message with functionCall parts
+            // Re-inject thought parts and thoughtSignature that Gemini 3.x requires on round-trips
             const parts = [];
             if (msg.content) {
                 parts.push({ text: msg.content });
             }
+            // Inject cached thought parts before function calls (fallback)
+            let thoughtsInjected = false;
             for (const tc of msg.tool_calls) {
-                parts.push({
+                if (!thoughtsInjected) {
+                    const cached = thoughtCache.get(tc.id);
+                    if (cached && cached.expires > Date.now() && cached.thoughtParts) {
+                        parts.push(...cached.thoughtParts);
+                        thoughtsInjected = true;
+                    }
+                }
+                const fcPart = {
                     functionCall: {
                         id: tc.id,
                         name: tc.function.name,
@@ -192,17 +369,38 @@ function convertMessages(messages) {
                             ? JSON.parse(tc.function.arguments)
                             : tc.function.arguments,
                     },
-                });
+                };
+                // Use thought_signature from client (passed through), or fall back to cache
+                if (tc.thought_signature) {
+                    fcPart.thoughtSignature = tc.thought_signature;
+                } else {
+                    const cached = thoughtCache.get(tc.id);
+                    if (cached && cached.expires > Date.now() && cached.thoughtSignature) {
+                        fcPart.thoughtSignature = cached.thoughtSignature;
+                    }
+                }
+                parts.push(fcPart);
             }
             contents.push({ role: 'model', parts });
         } else if (msg.role === 'tool') {
             // Tool result -> user message with functionResponse part
+            // Resolve function name: use msg.name, or look it up from the preceding assistant tool_calls
+            let funcName = msg.name || '';
+            if (!funcName && msg.tool_call_id) {
+                for (let i = messages.indexOf(msg) - 1; i >= 0; i--) {
+                    const prev = messages[i];
+                    if (prev.role === 'assistant' && prev.tool_calls) {
+                        const tc = prev.tool_calls.find(t => t.id === msg.tool_call_id);
+                        if (tc) { funcName = tc.function.name; break; }
+                    }
+                }
+            }
             // Try to merge consecutive tool messages into one user turn
             const lastContent = contents[contents.length - 1];
             const part = {
                 functionResponse: {
                     id: msg.tool_call_id,
-                    name: msg.name || '',
+                    name: funcName,
                     response: { output: msg.content },
                 },
             };
@@ -214,7 +412,7 @@ function convertMessages(messages) {
         } else {
             contents.push({
                 role: msg.role === 'assistant' ? 'model' : 'user',
-                parts: [{ text: msg.content || '' }],
+                parts: convertContentToParts(msg.content),
             });
         }
     }
@@ -224,22 +422,54 @@ function convertMessages(messages) {
 
 function convertGeminiFunctionCallsToOpenAI(parts) {
     const toolCalls = [];
+    // Collect thought parts (with thought_signature data) for round-trip preservation
+    const thoughtParts = parts.filter(p => p.thought);
+
     for (const part of parts) {
         if (part.functionCall) {
-            toolCalls.push({
-                id: part.functionCall.id || `call_${uuidv4().slice(0, 8)}`,
+            const callId = part.functionCall.id || `call_${uuidv4().slice(0, 8)}`;
+            const tc = {
+                id: callId,
                 type: 'function',
                 function: {
                     name: part.functionCall.name,
                     arguments: JSON.stringify(part.functionCall.args || {}),
                 },
+            };
+
+            // Pass thoughtSignature through to the client so it can echo it back.
+            // Gemini 3.x requires this on tool-call round-trips.
+            if (part.thoughtSignature) {
+                tc.thought_signature = part.thoughtSignature;
+            }
+
+            toolCalls.push(tc);
+        }
+    }
+
+    // Also cache thought parts server-side as fallback (client may not echo them)
+    if (thoughtParts.length > 0 && toolCalls.length > 0) {
+        for (const tc of toolCalls) {
+            thoughtCache.set(tc.id, {
+                thoughtParts,
+                expires: Date.now() + THOUGHT_CACHE_TTL,
             });
         }
     }
+
+    // Prune expired entries
+    for (const [key, val] of thoughtCache) {
+        if (val.expires < Date.now()) thoughtCache.delete(key);
+    }
+
     return toolCalls;
 }
 
 // --- Request building ---
+
+function isGemini3Model(model) {
+    return model && (model.startsWith('gemini-3-') || model.startsWith('gemini-3.'));
+}
 
 function buildRequestBody(model, project, messages, thinkingBudget, tools) {
     const { contents, systemInstruction } = convertMessages(messages);
@@ -247,11 +477,14 @@ function buildRequestBody(model, project, messages, thinkingBudget, tools) {
     const body = {
         model,
         project,
+        user_prompt_id: uuidv4(),
         request: {
             contents,
             generationConfig: {
                 temperature: 1,
-                maxOutputTokens: 65536,
+                topP: 0.95,
+                topK: 64,
+                maxOutputTokens: 65535,
             },
             safetySettings: [],
         },
@@ -259,10 +492,17 @@ function buildRequestBody(model, project, messages, thinkingBudget, tools) {
     };
 
     if (thinkingBudget > 0) {
-        body.request.generationConfig.thinkingConfig = {
-            thinkingBudget,
-            includeThoughts: true,
-        };
+        if (isGemini3Model(model)) {
+            body.request.generationConfig.thinkingConfig = {
+                thinkingLevel: 'HIGH',
+                includeThoughts: true,
+            };
+        } else {
+            body.request.generationConfig.thinkingConfig = {
+                thinkingBudget,
+                includeThoughts: true,
+            };
+        }
     }
 
     if (systemInstruction) {
@@ -275,6 +515,32 @@ function buildRequestBody(model, project, messages, thinkingBudget, tools) {
     }
 
     return body;
+}
+
+// --- Model safety for tool-call round-trips ---
+
+// Gemini 3.x requires thought_signature on tool-call round-trips.
+// If the client sends a round-2 request to a 3.x model but the tool_calls
+// lack thought_signature (e.g. because round-1 was served by a 2.5 fallback),
+// downgrade to a 2.5 model to avoid the 400 error.
+function safeModelForMessages(model, messages) {
+    if (!isGemini3Model(model)) return model;
+
+    for (const msg of messages) {
+        if (msg.role === 'assistant' && msg.tool_calls) {
+            const hasSignature = msg.tool_calls.some(tc =>
+                tc.thought_signature || thoughtCache.get(tc.id)?.thoughtSignature
+            );
+            if (!hasSignature) {
+                const fallback = 'gemini-2.5-flash';
+                log('warn', 'Downgrading model for tool round-trip (missing thought_signature)', {
+                    from: model, to: fallback,
+                });
+                return fallback;
+            }
+        }
+    }
+    return model;
 }
 
 // --- Non-streaming path ---
@@ -298,8 +564,8 @@ function parseSSEResponse(sseText) {
                     allParts.push(part);
                     if (part.functionCall) {
                         // collected in allParts
-                    } else if (part.text && part.thought) {
-                        thinkingText += part.text;
+                    } else if (part.thought) {
+                        if (part.text) thinkingText += part.text;
                     } else if (part.text) {
                         contentText += part.text;
                     }
@@ -315,27 +581,28 @@ function parseSSEResponse(sseText) {
     return { contentText, thinkingText, allParts, usage, modelVersion };
 }
 
-async function handleNonStreaming(req, res, token, project) {
+async function handleNonStreaming(req, res, token, project, reqId) {
     const { model, messages, tools } = req.body;
-    const geminiModel = model || DEFAULT_MODEL;
+    const geminiModel = safeModelForMessages(model || DEFAULT_MODEL, messages);
     const thinkingBudget = req.body.thinking?.budget_tokens || 0;
 
     const body = buildRequestBody(geminiModel, project, messages, thinkingBudget, tools);
 
-    const resp = await fetch(`${GEMINI_API_BASE}:streamGenerateContent?alt=sse`, {
+    const resp = await fetchWithRetry(`${GEMINI_API_BASE}:streamGenerateContent?alt=sse`, {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${token}`,
             'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
-    });
+    }, reqId);
 
     if (!resp.ok) {
         const err = await resp.text();
         throw new Error(`Gemini API error (${resp.status}): ${err}`);
     }
 
+    const actualModel = resp._actualModel || geminiModel;
     const sseText = await resp.text();
     const { contentText, thinkingText, allParts, usage, modelVersion } = parseSSEResponse(sseText);
 
@@ -356,7 +623,7 @@ async function handleNonStreaming(req, res, token, project) {
         id: `chatcmpl-${uuidv4()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
-        model: modelVersion || geminiModel,
+        model: modelVersion || actualModel,
         choices: [{
             index: 0,
             message,
@@ -372,23 +639,23 @@ async function handleNonStreaming(req, res, token, project) {
 
 // --- Streaming path ---
 
-async function handleStreaming(req, res, token, project) {
+async function handleStreaming(req, res, token, project, reqId) {
     const { model, messages, tools } = req.body;
-    const geminiModel = model || DEFAULT_MODEL;
+    const geminiModel = safeModelForMessages(model || DEFAULT_MODEL, messages);
     const thinkingBudget = req.body.thinking?.budget_tokens || 0;
     const chatId = `chatcmpl-${uuidv4()}`;
     const created = Math.floor(Date.now() / 1000);
 
     const body = buildRequestBody(geminiModel, project, messages, thinkingBudget, tools);
 
-    const resp = await fetch(`${GEMINI_API_BASE}:streamGenerateContent?alt=sse`, {
+    const resp = await fetchWithRetry(`${GEMINI_API_BASE}:streamGenerateContent?alt=sse`, {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${token}`,
             'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
-    });
+    }, reqId);
 
     if (!resp.ok) {
         const err = await resp.text();
@@ -400,10 +667,11 @@ async function handleStreaming(req, res, token, project) {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    let resolvedModel = geminiModel;
+    let resolvedModel = resp._actualModel || geminiModel;
     let sentRole = false;
     let toolCallIndex = 0;
     let hasToolCalls = false;
+    let streamThoughtParts = []; // collect thought parts for thought_signature caching
 
     function sendChunk(delta, finishReason) {
         const chunk = {
@@ -457,19 +725,30 @@ async function handleStreaming(req, res, token, project) {
                     if (part.functionCall) {
                         hasToolCalls = true;
                         const callId = part.functionCall.id || `call_${uuidv4().slice(0, 8)}`;
-                        sendChunk({
-                            tool_calls: [{
-                                index: toolCallIndex,
-                                id: callId,
-                                type: 'function',
-                                function: {
-                                    name: part.functionCall.name,
-                                    arguments: JSON.stringify(part.functionCall.args || {}),
-                                },
-                            }],
-                        }, null);
+                        // Cache thought parts for round-trip fallback
+                        if (streamThoughtParts.length > 0) {
+                            thoughtCache.set(callId, {
+                                thoughtParts: [...streamThoughtParts],
+                                expires: Date.now() + THOUGHT_CACHE_TTL,
+                            });
+                        }
+                        const tcObj = {
+                            index: toolCallIndex,
+                            id: callId,
+                            type: 'function',
+                            function: {
+                                name: part.functionCall.name,
+                                arguments: JSON.stringify(part.functionCall.args || {}),
+                            },
+                        };
+                        // Pass thoughtSignature through so client can echo it back
+                        if (part.thoughtSignature) {
+                            tcObj.thought_signature = part.thoughtSignature;
+                        }
+                        sendChunk({ tool_calls: [tcObj] }, null);
                         toolCallIndex++;
                     } else if (part.text && part.thought) {
+                        streamThoughtParts.push(part);
                         sendChunk({ reasoning_content: part.text }, null);
                     } else if (part.text) {
                         sendChunk({ content: part.text }, null);
@@ -488,7 +767,7 @@ async function handleStreaming(req, res, token, project) {
 
 // --- Routes ---
 
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '100mb' }));
 
 app.get('/v1/models', authenticate, (req, res) => {
     log('info', 'GET /v1/models', { ip: req.ip });
@@ -510,7 +789,12 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
     const reqId = uuidv4().slice(0, 8);
 
     const lastMsg = messages[messages.length - 1];
-    const promptPreview = lastMsg?.content?.substring(0, 100) || '(tool result)';
+    const lastContent = lastMsg?.content;
+    const promptPreview = typeof lastContent === 'string'
+        ? lastContent.substring(0, 100)
+        : Array.isArray(lastContent)
+            ? '(multi-modal)'
+            : '(tool result)';
 
     log('info', 'Request', {
         reqId,
@@ -527,9 +811,9 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
         const project = await discoverProjectId(token);
 
         if (stream) {
-            await handleStreaming(req, res, token, project);
+            await handleStreaming(req, res, token, project, reqId);
         } else {
-            await handleNonStreaming(req, res, token, project);
+            await handleNonStreaming(req, res, token, project, reqId);
         }
 
         const durationMs = Date.now() - startTime;
@@ -538,10 +822,12 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
         const durationMs = Date.now() - startTime;
         log('error', 'Request failed', { reqId, model: geminiModel, durationMs, error: err.message });
         if (!res.headersSent) {
-            res.status(500).json({
+            const status = err.message.includes('429') ? 429 : 500;
+            const type = status === 429 ? 'rate_limit_error' : 'internal_error';
+            res.status(status).json({
                 error: {
                     message: err.message,
-                    type: 'internal_error',
+                    type,
                 },
             });
         } else {
