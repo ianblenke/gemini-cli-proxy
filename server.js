@@ -19,6 +19,8 @@ const OAUTH_CREDS_PATH = process.env.OAUTH_CREDS_PATH ||
     path.join(process.env.HOME || '/home/node', '.gemini', 'oauth_creds.json');
 
 const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
+// RATE_LIMIT=0 means wait for quota instead of returning 429
+const RATE_LIMIT_WAIT = process.env.RATE_LIMIT === '0';
 
 // --- Logging ---
 
@@ -246,15 +248,15 @@ async function fetchWithRetry(url, options, reqId) {
         currentBody = swapModelInBody(currentBody, currentModel);
     }
 
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const maxAttempts = RATE_LIMIT_WAIT ? Infinity : MAX_RETRIES;
+    for (let attempt = 0; attempt <= maxAttempts; attempt++) {
         lastResp = await fetch(url, { ...options, body: currentBody });
         if (lastResp.ok || !RETRY_STATUS_CODES.has(lastResp.status)) {
-            // Attach the actual model used so handlers can report it
             lastResp._actualModel = currentModel;
             return lastResp;
         }
 
-        if (attempt >= MAX_RETRIES) break;
+        if (attempt >= MAX_RETRIES && !RATE_LIMIT_WAIT) break;
 
         let errBody = '';
         try { errBody = await lastResp.text(); } catch (e) {}
@@ -279,7 +281,18 @@ async function fetchWithRetry(url, options, reqId) {
                 continue;
             }
 
-            // All models exhausted — fail fast, don't make the client wait
+            // All models exhausted
+            if (RATE_LIMIT_WAIT && resetSecs > 0) {
+                // Wait for the shortest cooldown to expire, then retry
+                log('warn', 'All models quota exhausted, waiting for reset', {
+                    reqId, model: currentModel, waitSecs: resetSecs,
+                });
+                await new Promise(r => setTimeout(r, resetSecs * 1000 + 500));
+                // Reset cooldowns and try the best model again
+                currentModel = resolveAvailableModel(requestedModel);
+                currentBody = swapModelInBody(options.body, currentModel);
+                continue;
+            }
             log('warn', 'All models quota exhausted', {
                 reqId, model: currentModel, cooldownSecs: resetSecs,
             });
